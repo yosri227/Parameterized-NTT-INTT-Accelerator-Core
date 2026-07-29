@@ -90,8 +90,8 @@ cd ntt_accelerator
 ./run_testsuite.sh
 ```
 ################################################################################################
-- run_all.sh checks that the RTL matches the Pease architecture (golden model in gen_vectors.py). Pass/fail is RTL-vs-Python-model comparison.
-- run_testsuite.sh checks that the Pease RTL works AND its output is equivalent to FIPS 203. The Python script testsuite.py already cross-validates every test vector between Pease and the Kyber CT reference before the RTL runs — if they don't match, the vectors are never written. Then the RTL is tested against those pre-validated vectors.
+- run_all.sh :: checks that the RTL matches the Pease architecture (golden model in gen_vectors.py). Pass/fail is RTL-vs-Python-model comparison.
+- run_testsuite.sh :: checks that the Pease RTL works AND its output is equivalent to FIPS 203. The Python script testsuite.py already cross-validates every test vector between Pease and the Kyber CT reference before the RTL runs — if they don't match, the vectors are never written. Then the RTL is tested against those pre-validated vectors.
 So run_testsuite.sh is the stronger check: it proves that the constant-geometry Pease RTL produces the same results as the standard NIST Kyber NTT, which run_all.sh alone does not verify.
 
 ##################################################################################################

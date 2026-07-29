@@ -1,0 +1,18 @@
+Test Suite Summary — SCHEME=KYBER Q=3329 N=128
+============================================================
+  [PASS] case_00: zeros_all — All coefficients = 0
+  [PASS] case_01: ones_all — All coefficients = 1
+  [PASS] case_02: impulse_0 — Unit impulse at index 0
+  [PASS] case_03: impulse_64 — Unit impulse at index 64
+  [PASS] case_04: impulse_127 — Unit impulse at index 127
+  [PASS] case_05: max_val — All coefficients = Q-1 (3328)
+  [PASS] case_06: alternating_01 — Alternating 0,1,0,1,...
+  [PASS] case_07: alternating_0max — Alternating 0,3328,...
+  [PASS] case_08: random_seed42 — Random seed 42
+  [PASS] case_09: random_seed100 — Random seed 100
+  [PASS] case_10: random_seed200 — Random seed 200
+  [PASS] case_11: random_seed300 — Random seed 300
+  [PASS] case_12: random_seed500 — Random seed 500
+  [PASS] case_13: ascending — Ascending 0..127
+  [PASS] case_14: descending — Descending 127..0
+  [PASS] case_15: small_vals — Small values 0..10

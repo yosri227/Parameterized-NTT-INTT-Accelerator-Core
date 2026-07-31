@@ -386,8 +386,8 @@ Two real bugs documented in the RTL comments (left intentionally as instructive 
 
 ## References
 
-- FIPS 203 (ML-KEM): https://csrc.nist.gov/pubs/fips/203
-- FIPS 204 (ML-DSA): https://csrc.nist.gov/pubs/fips/204
+- FIPS 203 (ML-KEM): https://doi.org/10.6028/NIST.FIPS.203
+- FIPS 204 (ML-DSA): https://doi.org/10.6028/NIST.FIPS.204
 - FIPS 206 (FN-DSA, draft): https://csrc.nist.gov/pubs/fips/206
 - Pease, M.C. "An adaptation of the fast Fourier transform for parallel processing,"
   J. ACM, 1968.

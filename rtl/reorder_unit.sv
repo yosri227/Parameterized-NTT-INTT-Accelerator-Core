@@ -27,10 +27,11 @@
 //
 // Forward (CT) stages run s = 0 .. LOGN-1 with a rotate-LEFT applied AFTER
 // each stage's butterfly (write-back address = rotl(logical_addr)).
-// Inverse (GS) stages run s = LOGN-1 .. 0 with a rotate-RIGHT applied
-// BEFORE each stage's butterfly (read address = rotr(logical_addr)); this
-// exactly undoes the forward permutation (verified against the Python
-// golden model bit-for-bit).
+// Inverse (GS) stages run s = LOGN-1 .. 0 with the SAME rotate-LEFT applied
+// BEFORE each stage's butterfly (read address = rotl(logical_addr)); used at
+// the opposite point of the dataflow it is the exact inverse of the forward
+// shuffle and undoes it (verified against the Python golden model
+// bit-for-bit).
 // =============================================================================
 module reorder_unit #(
   parameter int unsigned N    = ntt_pkg::N,
@@ -40,7 +41,6 @@ module reorder_unit #(
   input  logic                rst_n,
   input  logic                stage_adv,   // pulse: move FSR to next stage
   input  logic                stage_ld,    // pulse: (re)load FSR to stage 0 (one-hot bit0)
-  input  ntt_pkg::ntt_mode_e  mode,
 
   output logic [LOGN-1:0]     stage_num,   // 0..LOGN-1, decoded from the FSR (for twiddle exp calc)
   output logic                last_stage
@@ -82,9 +82,6 @@ endmodule : reorder_unit
 //     FWD "shuffle" step is defined as out[i]=in[rotr(i)], so its inverse
 //     is out[i]=in[rotl(i)] - verified bit-exact, stage by stage, against
 //     the Python golden model]
-// The `mode` input is kept (rather than deleting it) so the module remains
-// the single, obvious place to extend if a future scheme ever needs an
-// asymmetric mapping; today both branches compute the same result.
 // -----------------------------------------------------------------------------
 module ru_rotate #(
   parameter int unsigned LOGN = ntt_pkg::LOGN

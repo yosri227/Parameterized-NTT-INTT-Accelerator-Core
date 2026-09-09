@@ -20,6 +20,19 @@
 //   - INV starts at bufB (so it can directly consume a preceding FWD's
 //     output with no copy) and ends at bufA, followed by one scale-by-1/N
 //     pass over bufA using the shared Barrett reducer.
+//
+// Completion semantics: `done` asserts only after every pending write has
+// actually landed in memory. A DRAIN state (WR_LAT cycles) follows the last
+// RUN stage and the SCALE pass, covering the BU's fixed pipeline latency;
+// entering ST_DONE therefore coincides with the final data commit, so
+// results can be read out combinationally in the first `done` cycle.
+//
+// Read-out stability: the output-buffer select is captured at `start`,
+// so changing `op_mode` after completion cannot mux the wrong buffer.
+// The operating mode is likewise captured at `start` (mode_q): a glitch or
+// change on op_mode mid-operation cannot corrupt addressing/twiddles. The
+// load interface and the output-select capture intentionally sample live
+// op_mode - drive both before asserting `start`.
 // =============================================================================
 module ntt_top #(
   parameter int unsigned Q     = ntt_pkg::Q,
@@ -28,7 +41,8 @@ module ntt_top #(
   parameter int unsigned N     = ntt_pkg::N,
   parameter int unsigned LOGN  = ntt_pkg::LOGN,
   parameter longint unsigned MU = ntt_pkg::BARRETT_MU,
-  parameter int unsigned NINV  = ntt_pkg::N_INV
+  parameter int unsigned NINV  = ntt_pkg::N_INV,
+  parameter bit          PIPELINE = 1'b1
 )(
   input  logic               clk,
   input  logic               rst_n,
@@ -56,6 +70,33 @@ module ntt_top #(
   localparam int unsigned LANEW  = LOGN-1;         // width of a lane index (0..N/2-1)
   localparam int unsigned CNTW   = (QTR <= 1) ? 1 : $clog2(QTR);
 
+  // Write-back delay that matches the butterfly output latency. A pipelined
+  // BU holds its outputs stable for WR_LAT=2 cycles (one full stage-A/B
+  // round trip), so the address/valid path is delayed by a matching shift
+  // register. A combinational BU (latency 0) changes outputs every cycle,
+  // so its results MUST be written back in the same cycle - any delay would
+  // capture the next lane's data. DRAIN_CYCLES is the FSM wait that lets
+  // every in-flight write commit before ST_DONE; it also always covers the
+  // scale pass's fixed 1-cycle result register.
+  localparam int unsigned WR_LAT       = PIPELINE ? 2 : 0;
+  localparam int unsigned DRAIN_CYCLES = PIPELINE ? 2 : 1;
+
+  // The pipelined BU commits its writes WR_LAT cycles after the corresponding
+  // read, so across a stage boundary the early lanes of stage s+1 can race the
+  // final writes of stage s. The worst-case cross-stage dependency lag is
+  // QTR/2-1 cycles, which is only covered by the QTR-cycle stage span when
+  // QTR >= 4, i.e. N >= 16. All supported schemes have N >= 128.
+  initial begin
+    if (((Q - 1) % (2 * N)) != 0) begin
+      $display("FATAL: ntt_top: Q-1 is not divisible by 2N - incomplete radix-2 NTT (bad SCHEME/N pair)");
+      $finish;
+    end
+    if (N < 16) begin
+      $display("FATAL: ntt_top: N=%0d < 16 - ping-pong write pipeline races next-stage reads (stage span QTR=%0d must be >= 4)", N, QTR);
+      $finish;
+    end
+  end
+
   // ------------------------------------------------------------------
   // Storage: two ping-pong buffers, each N words. Modeled as simple
   // multi-port register arrays here for clarity/simulation; a real ASIC/FPGA
@@ -64,11 +105,20 @@ module ntt_top #(
   logic [W-1:0] bufA [0:N-1];
   logic [W-1:0] bufB [0:N-1];
 
-  typedef enum logic [1:0] {ST_IDLE, ST_RUN, ST_SCALE, ST_DONE} state_e;
+  typedef enum logic [2:0] {ST_IDLE, ST_RUN, ST_DRAIN, ST_SCALE, ST_DONE} state_e;
   state_e state, state_n;
 
   // current/other buffer selector: 0 => current=A,other=B ; 1 => current=B,other=A
   logic cur_sel, cur_sel_n;
+
+  // op_mode latched at start; drives all RUN-phase datapath and control.
+  // FSM branches that consume start itself keep sampling live op_mode
+  // because mode_q still holds the previous op on that edge.
+  ntt_pkg::ntt_mode_e mode_q;
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n)     mode_q <= ntt_pkg::MODE_FWD;
+    else if (start) mode_q <= op_mode;
+  end
 
   // ------------------------------------------------------------------
   // FSR-based stage sequencer (Reordering Unit)
@@ -80,7 +130,6 @@ module ntt_top #(
   reorder_unit #(.N(N), .LOGN(LOGN)) u_ru (
     .clk(clk), .rst_n(rst_n),
     .stage_adv(stage_adv), .stage_ld(stage_ld),
-    .mode(op_mode),
     .stage_num(stage_num), .last_stage(last_stage)
   );
 
@@ -89,7 +138,7 @@ module ntt_top #(
   // index is what the twiddle-exponent formula actually needs (verified
   // against the Python golden model).
   logic [LOGN-1:0] stage_eff;
-  assign stage_eff = (op_mode == MODE_FWD) ? stage_num : (LOGN-1 - stage_num);
+  assign stage_eff = (mode_q == MODE_FWD) ? stage_num : (LOGN-1 - stage_num);
 
   // lane counter: 0 .. QTR-1, two lanes serviced per cycle (lane, lane+QTR)
   logic [CNTW-1:0] lane_cnt, lane_cnt_n;
@@ -122,7 +171,7 @@ module ntt_top #(
   ru_rotate #(.LOGN(LOGN)) u_rotB1 (.addr_in(idxB1), .addr_out(rotB1));
 
   always_comb begin
-    if (op_mode == MODE_FWD) begin
+    if (mode_q == MODE_FWD) begin
       // read directly, rotate-left applied on write-back
       pairA0_rd = idxA0; pairA1_rd = idxA1;
       pairB0_rd = idxB0; pairB1_rd = idxB1;
@@ -146,7 +195,7 @@ module ntt_top #(
 
   logic [W-1:0] tw0, tw1;
   twiddle_rom #(.Q(Q), .W(W), .N(N)) u_twrom (
-    .clk(clk), .mode(op_mode),
+    .mode(mode_q),
     .addr_a(twaddr0), .tw_a(tw0),
     .addr_b(twaddr1), .tw_b(tw1)
   );
@@ -155,17 +204,14 @@ module ntt_top #(
   // Memory read mux (current buffer) for the two BUs
   // ------------------------------------------------------------------
   logic [W-1:0] bu0_a_in, bu0_b_in, bu1_a_in, bu1_b_in;
-  logic [LOGN-1:0] rdA0, rdA1, rdB0, rdB1; // BU0 reads (rdA0,rdA1); BU1 reads (rdB0,rdB1)
-  assign rdA0 = pairA0_rd; assign rdA1 = pairA1_rd;
-  assign rdB0 = pairB0_rd; assign rdB1 = pairB1_rd;
 
   always_comb begin
     if (cur_sel == 1'b0) begin // current = bufA
-      bu0_a_in = bufA[rdA0]; bu0_b_in = bufA[rdA1];
-      bu1_a_in = bufA[rdB0]; bu1_b_in = bufA[rdB1];
+      bu0_a_in = bufA[pairA0_rd]; bu0_b_in = bufA[pairA1_rd];
+      bu1_a_in = bufA[pairB0_rd]; bu1_b_in = bufA[pairB1_rd];
     end else begin             // current = bufB
-      bu0_a_in = bufB[rdA0]; bu0_b_in = bufB[rdA1];
-      bu1_a_in = bufB[rdB0]; bu1_b_in = bufB[rdB1];
+      bu0_a_in = bufB[pairA0_rd]; bu0_b_in = bufB[pairA1_rd];
+      bu1_a_in = bufB[pairB0_rd]; bu1_b_in = bufB[pairB1_rd];
     end
   end
 
@@ -175,76 +221,144 @@ module ntt_top #(
   logic bu_valid_in, bu0_valid_out, bu1_valid_out;
   logic [W-1:0] bu0_y0, bu0_y1, bu1_y0, bu1_y1;
 
-  butterfly_unit #(.Q(Q), .W(W), .MULW(MULW), .MU(MU), .PIPELINE(1)) u_bu0 (
-    .clk(clk), .rst_n(rst_n), .valid_in(bu_valid_in), .mode(op_mode),
+  butterfly_unit #(.Q(Q), .W(W), .MULW(MULW), .MU(MU), .PIPELINE(PIPELINE)) u_bu0 (
+    .clk(clk), .rst_n(rst_n), .valid_in(bu_valid_in), .mode(mode_q),
     .a_in(bu0_a_in), .b_in(bu0_b_in), .w_in(tw0),
     .y0_out(bu0_y0), .y1_out(bu0_y1), .valid_out(bu0_valid_out)
   );
-  butterfly_unit #(.Q(Q), .W(W), .MULW(MULW), .MU(MU), .PIPELINE(1)) u_bu1 (
-    .clk(clk), .rst_n(rst_n), .valid_in(bu_valid_in), .mode(op_mode),
+  butterfly_unit #(.Q(Q), .W(W), .MULW(MULW), .MU(MU), .PIPELINE(PIPELINE)) u_bu1 (
+    .clk(clk), .rst_n(rst_n), .valid_in(bu_valid_in), .mode(mode_q),
     .a_in(bu1_a_in), .b_in(bu1_b_in), .w_in(tw1),
     .y0_out(bu1_y0), .y1_out(bu1_y1), .valid_out(bu1_valid_out)
   );
 
-  // delay the write-address/other-buffer-select by 1 cycle to match the BU's
-  // fixed 1-cycle pipeline latency (no extra buffering: a single register)
-  logic [LOGN-1:0] wrA0_d, wrA1_d, wrB0_d, wrB1_d;
-  logic wr_other_d, wr_valid_d;
+  // ------------------------------------------------------------------
+  // Write-back: delay address / target-buffer-select / valid by exactly
+  // WR_LAT cycles to match the BU's pipeline latency (no extra buffering:
+  // one shift register chain). Only the valid chain needs a reset; the
+  // address/select chains are garbage-safe while invalid.
+  // ------------------------------------------------------------------
+  generate
+    if (WR_LAT > 0) begin : g_wr_pipe
+      logic [LOGN-1:0]   wrA0_q [WR_LAT];
+      logic [LOGN-1:0]   wrA1_q [WR_LAT];
+      logic [LOGN-1:0]   wrB0_q [WR_LAT];
+      logic [LOGN-1:0]   wrB1_q [WR_LAT];
+      logic              wr_other_q [WR_LAT];
+      logic [WR_LAT-1:0] wr_valid_q;
 
-  always_ff @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-      wr_valid_d <= 1'b0;
-    end else begin
-      wrA0_d <= pairA0_wr; wrA1_d <= pairA1_wr;
-      wrB0_d <= pairB0_wr; wrB1_d <= pairB1_wr;
-      wr_other_d <= ~cur_sel;
-      wr_valid_d <= bu_valid_in && (state == ST_RUN);
-    end
-  end
+      always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+          wr_valid_q <= '0;
+        end else begin
+          wr_valid_q[0] <= bu_valid_in && (state == ST_RUN);
+          for (int d = 1; d < WR_LAT; d++) wr_valid_q[d] <= wr_valid_q[d-1];
 
-  always_ff @(posedge clk) begin
-    if (wr_valid_d) begin
-      if (wr_other_d == 1'b0) begin // other = bufA
-        bufA[wrA0_d] <= bu0_y0; bufA[wrA1_d] <= bu0_y1;
-        bufA[wrB0_d] <= bu1_y0; bufA[wrB1_d] <= bu1_y1;
-      end else begin                 // other = bufB
-        bufB[wrA0_d] <= bu0_y0; bufB[wrA1_d] <= bu0_y1;
-        bufB[wrB0_d] <= bu1_y0; bufB[wrB1_d] <= bu1_y1;
+          wrA0_q[0] <= pairA0_wr; wrA1_q[0] <= pairA1_wr;
+          wrB0_q[0] <= pairB0_wr; wrB1_q[0] <= pairB1_wr;
+          wr_other_q[0] <= ~cur_sel;
+          for (int d = 1; d < WR_LAT; d++) begin
+            wrA0_q[d] <= wrA0_q[d-1]; wrA1_q[d] <= wrA1_q[d-1];
+            wrB0_q[d] <= wrB0_q[d-1]; wrB1_q[d] <= wrB1_q[d-1];
+            wr_other_q[d] <= wr_other_q[d-1];
+          end
+        end
+      end
+
+      always_ff @(posedge clk) begin
+        if (wr_valid_q[WR_LAT-1]) begin
+          if (wr_other_q[WR_LAT-1] == 1'b0) begin // other = bufA
+            bufA[wrA0_q[WR_LAT-1]] <= bu0_y0; bufA[wrA1_q[WR_LAT-1]] <= bu0_y1;
+            bufA[wrB0_q[WR_LAT-1]] <= bu1_y0; bufA[wrB1_q[WR_LAT-1]] <= bu1_y1;
+          end else begin                          // other = bufB
+            bufB[wrA0_q[WR_LAT-1]] <= bu0_y0; bufB[wrA1_q[WR_LAT-1]] <= bu0_y1;
+            bufB[wrB0_q[WR_LAT-1]] <= bu1_y0; bufB[wrB1_q[WR_LAT-1]] <= bu1_y1;
+          end
+        end
+      end
+    end else begin : g_wr_direct
+      // combinational BU: results are only valid this cycle - write now
+      always_ff @(posedge clk) begin
+        if (bu_valid_in && (state == ST_RUN)) begin
+          if (~cur_sel == 1'b0) begin             // other = bufA
+            bufA[pairA0_wr] <= bu0_y0; bufA[pairA1_wr] <= bu0_y1;
+            bufA[pairB0_wr] <= bu1_y0; bufA[pairB1_wr] <= bu1_y1;
+          end else begin                          // other = bufB
+            bufB[pairA0_wr] <= bu0_y0; bufB[pairA1_wr] <= bu0_y1;
+            bufB[pairB0_wr] <= bu1_y0; bufB[pairB1_wr] <= bu1_y1;
+          end
+        end
       end
     end
-  end
+  endgenerate
 
   // ------------------------------------------------------------------
-  // 1/N scaling pass (INV only): reuse a Barrett reducer to multiply every
-  // word of bufA by N_INV mod Q once the last INV stage has drained.
+  // 1/N scaling pass (INV only): multiply every word of bufA by N_INV mod Q
+  // through a dedicated Barrett reducer once the last INV stage has drained.
   // ------------------------------------------------------------------
   logic [LOGN-1:0] scale_addr, scale_addr_n;
-  logic [MULW-1:0] scale_prod;
-  logic [W-1:0]    scale_res;
-  logic            scale_valid_d;
-  logic [LOGN-1:0] scale_addr_d;
-  logic [W-1:0]    scale_res_d;
+  logic [MULW-1:0] sc_prod;
+  logic [MULW-1:0] sc_barrett_in;
+  logic [W-1:0]    sc_res;
 
-  assign scale_prod = bufA[scale_addr] * NINV[W-1:0];
+  assign sc_prod = bufA[scale_addr] * NINV[W-1:0];
+
   barrett_reduce #(.Q(Q), .W(W), .MULW(MULW), .MU(MU)) u_scale_barrett (
-    .in_val(scale_prod), .out_val(scale_res)
+    .in_val(sc_barrett_in), .out_val(sc_res)
   );
 
-  always_ff @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-      scale_valid_d <= 1'b0;
-    end else begin
-      scale_valid_d <= (state == ST_SCALE);
-      scale_addr_d  <= scale_addr;
-      scale_res_d   <= scale_res;   // must be captured the SAME cycle as scale_addr_d,
-                                     // since scale_res is purely combinational from
-                                     // scale_addr - registering only the address and
-                                     // not the data would desync them by one cycle.
+  generate
+    if (PIPELINE) begin : g_scale_pipe
+      // read -> reg -> Barrett (comb) -> reg -> write, matching WR_LAT = 2:
+      // the final scaled word commits on the last DRAIN cycle before ST_DONE.
+      // The address travels through BOTH register stages alongside the data
+      // so the write always pairs each result with its own address.
+      logic [MULW-1:0]  sc_prod_q;
+      logic [W-1:0]     sc_res_q;
+      logic [LOGN-1:0]  sc_addr_q [WR_LAT];
+      logic [WR_LAT-1:0] sc_valid_q;
+
+      assign sc_barrett_in = sc_prod_q;
+
+      always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+          sc_valid_q <= '0;
+        end else begin
+          sc_valid_q[0] <= (state == ST_SCALE);
+          for (int d = 1; d < WR_LAT; d++) sc_valid_q[d] <= sc_valid_q[d-1];
+          sc_prod_q     <= sc_prod;
+          sc_addr_q[0]  <= scale_addr;
+          sc_res_q      <= sc_res;
+          for (int d = 1; d < WR_LAT; d++) sc_addr_q[d] <= sc_addr_q[d-1];
+        end
+      end
+      always_ff @(posedge clk) begin
+        if (sc_valid_q[WR_LAT-1]) bufA[sc_addr_q[WR_LAT-1]] <= sc_res_q;
+      end
+    end else begin : g_scale_comb
+      // unpipelined BU variant keeps the original single-register scheme:
+      // read + Barrett in the same cycle, result registered beside its
+      // address (registering only the address would desync them by one cycle).
+      logic [LOGN-1:0] sc_addr_q;
+      logic [W-1:0]    sc_res_q;
+      logic            sc_valid_q;
+
+      assign sc_barrett_in = sc_prod;
+
+      always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+          sc_valid_q <= 1'b0;
+        end else begin
+          sc_valid_q <= (state == ST_SCALE);
+          sc_addr_q  <= scale_addr;
+          sc_res_q   <= sc_res;
+        end
+      end
+      always_ff @(posedge clk) begin
+        if (sc_valid_q) bufA[sc_addr_q] <= sc_res_q;
+      end
     end
-  end
-  always_ff @(posedge clk) begin
-    if (scale_valid_d) bufA[scale_addr_d] <= scale_res_d;
-  end
+  endgenerate
 
   // FWD loads into bufA (starting buffer). INV loads into the starting
   // buffer: bufB for odd LOGN, bufA for even LOGN.
@@ -256,15 +370,29 @@ module ntt_top #(
     end
   end
 
-  // FWD result lands in: B if LOGN odd, A if LOGN even.
-  // INV result always lands in A (after SCALE), regardless of LOGN parity.
-  assign rd_data = (op_mode == MODE_FWD) ?
-    (LOGN[0] ? bufB[rd_addr] : bufA[rd_addr]) :
-    bufA[rd_addr];
+  // Output-buffer select captured at start: FWD lands in B iff LOGN odd,
+  // INV always lands in A (after SCALE). Latching keeps read-out stable even
+  // if op_mode changes afterwards.
+  logic rd_buf_b_q;
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n)     rd_buf_b_q <= 1'b0;
+    else if (start) rd_buf_b_q <= (op_mode == MODE_FWD) ? LOGN[0] : 1'b0;
+  end
+  assign rd_data = rd_buf_b_q ? bufB[rd_addr] : bufA[rd_addr];
 
   // ------------------------------------------------------------------
   // Control FSM
+  //
+  //   IDLE -> RUN -> DRAIN -> [SCALE -> DRAIN] -> DONE
+  //
+  // DRAIN (WR_LAT cycles) covers the BU/scale-pipeline latency after the
+  // last RUN lane and after the SCALE pass, so ST_DONE - and therefore
+  // `done` - is only ever reached once every write has been committed.
   // ------------------------------------------------------------------
+  localparam int unsigned DCW = (DRAIN_CYCLES <= 1) ? 1 : $clog2(DRAIN_CYCLES);
+  logic [DCW-1:0] drain_cnt, drain_cnt_n;
+  logic drain_to_scale, drain_to_scale_n;
+
   always_comb begin
     state_n      = state;
     cur_sel_n    = cur_sel;
@@ -273,6 +401,8 @@ module ntt_top #(
     stage_ld     = 1'b0;
     bu_valid_in  = 1'b0;
     scale_addr_n = scale_addr;
+    drain_cnt_n  = drain_cnt;
+    drain_to_scale_n = drain_to_scale;
 
     unique case (state)
       ST_IDLE: begin
@@ -295,18 +425,36 @@ module ntt_top #(
           stage_adv  = 1'b1;
           cur_sel_n  = ~cur_sel;
           if (last_stage) begin
-            if (op_mode == MODE_INV) state_n = ST_SCALE;
-            else                     state_n = ST_DONE;
-            scale_addr_n = '0;
+            state_n          = ST_DRAIN;
+            drain_cnt_n      = '0;
+            drain_to_scale_n = (mode_q == MODE_INV);
           end
         end else begin
           lane_cnt_n = lane_cnt + 1'b1;
         end
       end
 
+      ST_DRAIN: begin
+        if (drain_cnt == DRAIN_CYCLES-1) begin
+          if (drain_to_scale) begin
+            state_n      = ST_SCALE;
+            scale_addr_n = '0;
+          end else begin
+            state_n = ST_DONE;
+          end
+        end else begin
+          drain_cnt_n = drain_cnt + 1'b1;
+        end
+      end
+
       ST_SCALE: begin
-        if (scale_addr == N-1) state_n = ST_DONE;
-        else                    scale_addr_n = scale_addr + 1'b1;
+        if (scale_addr == N-1) begin
+          state_n          = ST_DRAIN;
+          drain_cnt_n      = '0;
+          drain_to_scale_n = 1'b0;
+        end else begin
+          scale_addr_n = scale_addr + 1'b1;
+        end
       end
 
       ST_DONE: begin
@@ -324,19 +472,23 @@ module ntt_top #(
 
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
-      state    <= ST_IDLE;
-      cur_sel  <= 1'b0;
-      lane_cnt <= '0;
-      scale_addr <= '0;
+      state       <= ST_IDLE;
+      cur_sel     <= 1'b0;
+      lane_cnt    <= '0;
+      scale_addr  <= '0;
+      drain_cnt   <= '0;
+      drain_to_scale <= 1'b0;
     end else begin
-      state    <= state_n;
-      cur_sel  <= cur_sel_n;
-      lane_cnt <= lane_cnt_n;
-      scale_addr <= scale_addr_n;
+      state       <= state_n;
+      cur_sel     <= cur_sel_n;
+      lane_cnt    <= lane_cnt_n;
+      scale_addr  <= scale_addr_n;
+      drain_cnt   <= drain_cnt_n;
+      drain_to_scale <= drain_to_scale_n;
     end
   end
 
-  assign busy = (state == ST_RUN) || (state == ST_SCALE);
+  assign busy = (state == ST_RUN) || (state == ST_DRAIN) || (state == ST_SCALE);
   assign done = (state == ST_DONE);
 
 endmodule : ntt_top

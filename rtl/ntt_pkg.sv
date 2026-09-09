@@ -14,7 +14,7 @@
 //                   128-point/7-stage NTT and finishes pairs of coefficients
 //                   with a base multiplication step - this core reproduces
 //                   that exactly for SCHEME=KYBER, N=128).
-//   - Dilithium  : Q = 8380417, Q-1 = 8380416 = 2^13*1021 -> complete N=256 OK
+//   - Dilithium  : Q = 8380417, Q-1 = 8380416 = 2^13*1023 -> complete N=256 OK
 //   - Falcon     : Q = 12289,   Q-1 = 12288   = 2^12*3    -> complete N up to 2048
 //
 // ZETA (2N-th root) values below are the standard constants used by each

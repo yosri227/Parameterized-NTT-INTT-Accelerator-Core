@@ -18,7 +18,7 @@
 // would need an extra multiplier and Fermat-exponentiation hardware), the
 // precomputed inverse values are stored at the *same address* as their
 // forward counterpart, so the control unit's stage-index address generator
-// (see ru_addr_gen.sv) drives both planes identically and only the mode
+// drives both planes identically and only the mode
 // signal (FWD/INV) selects which plane is read. This keeps the address
 // generator itself the "recomputation" logic while avoiding a runtime
 // inverter.
@@ -36,7 +36,6 @@ module twiddle_rom #(
   parameter string       FWD_HEX = "twiddle_fwd.hex",
   parameter string       INV_HEX = "twiddle_inv.hex"
 )(
-  input  logic                 clk,
   input  ntt_pkg::ntt_mode_e   mode,
 
   input  logic [AW-1:0]        addr_a,
